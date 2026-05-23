@@ -17,7 +17,8 @@ import {
   Settings,
   Sparkles,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { getSupabaseBrowserClient } from "@/lib/supabase-browser";
 
 type Status = "TODO" | "IN_PROGRESS" | "REVIEW" | "DONE";
 type Priority = "LOW" | "MEDIUM" | "HIGH";
@@ -202,11 +203,16 @@ function niceDate(value: string | null) {
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(new Date(value));
 }
 
+function dateInputValue(value: string | null | undefined) {
+  return value ? value.slice(0, 10) : "";
+}
+
 function isOverdue(task: Task) {
-  return Boolean(task.deadline && task.deadline < today && task.status !== "DONE");
+  return Boolean(task.deadline && dateInputValue(task.deadline) < today && task.status !== "DONE");
 }
 
 export default function DevFlowApp() {
+  const supabase = useMemo(() => getSupabaseBrowserClient(), []);
   const [store, setStore] = useState<Store>(() => readStore());
   const [sessionId, setSessionId] = useState<string | null>(() => (typeof window === "undefined" ? null : localStorage.getItem("devflow-session")));
   const [authMode, setAuthMode] = useState<"login" | "register">(() => {
@@ -232,6 +238,50 @@ export default function DevFlowApp() {
   const [sprintModal, setSprintModal] = useState<Sprint | null | "new">(null);
   const [selectedDetail, setSelectedDetail] = useState<{ kind: "project" | "sprint"; id: string } | null>(null);
   const [toast, setToast] = useState("");
+  const [isRemoteReady, setIsRemoteReady] = useState(false);
+
+  const flash = useCallback((message: string) => {
+    setToast(message);
+    window.setTimeout(() => setToast(""), 2200);
+  }, []);
+
+  const loadRemoteStore = useCallback(
+    async (token: string, userId: string, email: string) => {
+      const response = await fetch("/api/devflow", { headers: { Authorization: `Bearer ${token}` } });
+      if (!response.ok) {
+        flash("Data failed to load");
+        return;
+      }
+      const data = (await response.json()) as Store;
+      setStore({ ...data, users: [{ id: userId, email, password: "" }] });
+    },
+    [flash],
+  );
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!data.session?.user) {
+        setIsRemoteReady(true);
+        return;
+      }
+      setSessionId(data.session.user.id);
+      loadRemoteStore(data.session.access_token, data.session.user.id, data.session.user.email ?? "user@devflow.local").finally(() => setIsRemoteReady(true));
+    });
+
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session?.user) {
+        setSessionId(null);
+        setStore(emptyStore);
+        return;
+      }
+      setSessionId(session.user.id);
+      loadRemoteStore(session.access_token, session.user.id, session.user.email ?? "user@devflow.local");
+    });
+
+    return () => data.subscription.unsubscribe();
+  }, [loadRemoteStore, supabase]);
 
   useEffect(() => {
     if (store.users.length) localStorage.setItem("devflow-store", JSON.stringify(store));
@@ -253,7 +303,7 @@ export default function DevFlowApp() {
       const deadlineMatch =
         filters.deadline === "ALL" ||
         (filters.deadline === "OVERDUE" && isOverdue(task)) ||
-        (filters.deadline === "UPCOMING" && Boolean(task.deadline && task.deadline >= today));
+        (filters.deadline === "UPCOMING" && Boolean(task.deadline && dateInputValue(task.deadline) >= today));
       return (
         searchMatch &&
         (filters.projectId === "ALL" || task.projectId === filters.projectId) &&
@@ -266,7 +316,35 @@ export default function DevFlowApp() {
     });
   }, [filters, userTasks]);
 
-  const saveTask = (task: Task) => {
+  const remoteMutation = async (body: unknown) => {
+    if (!supabase) return false;
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    const remoteUser = data.session?.user;
+    if (!token || !remoteUser) return false;
+    const response = await fetch("/api/devflow", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      flash("Database update failed");
+      return true;
+    }
+    await loadRemoteStore(token, remoteUser.id, remoteUser.email ?? "user@devflow.local");
+    return true;
+  };
+
+  const deleteRemote = async (action: "deleteProject" | "deleteSprint" | "deleteTask", idValue: string) => {
+    return remoteMutation({ action, id: idValue });
+  };
+
+  const saveTask = async (task: Task) => {
+    if (await remoteMutation({ action: "upsertTask", payload: task })) {
+      setTaskModal(null);
+      flash("Task saved");
+      return;
+    }
     setStore((current) => ({
       ...current,
       tasks: current.tasks.some((item) => item.id === task.id)
@@ -277,7 +355,12 @@ export default function DevFlowApp() {
     flash("Task saved");
   };
 
-  const saveProject = (project: Project) => {
+  const saveProject = async (project: Project) => {
+    if (await remoteMutation({ action: "upsertProject", payload: project })) {
+      setProjectModal(null);
+      flash("Project saved");
+      return;
+    }
     setStore((current) => ({
       ...current,
       projects: current.projects.some((item) => item.id === project.id)
@@ -288,9 +371,14 @@ export default function DevFlowApp() {
     flash("Project saved");
   };
 
-  const saveSprint = (sprint: Sprint) => {
+  const saveSprint = async (sprint: Sprint) => {
     if (sprint.endDate < sprint.startDate) {
       flash("End date cannot be earlier than start date");
+      return;
+    }
+    if (await remoteMutation({ action: "upsertSprint", payload: sprint })) {
+      setSprintModal(null);
+      flash("Sprint saved");
       return;
     }
     setStore((current) => ({
@@ -303,11 +391,6 @@ export default function DevFlowApp() {
     flash("Sprint saved");
   };
 
-  const flash = (message: string) => {
-    setToast(message);
-    window.setTimeout(() => setToast(""), 2200);
-  };
-
   const navigate = (nextView: View) => {
     setView(nextView);
     setSelectedDetail(null);
@@ -315,10 +398,19 @@ export default function DevFlowApp() {
   };
 
   const logout = () => {
+    if (supabase) supabase.auth.signOut();
     localStorage.removeItem("devflow-session");
     setSessionId(null);
     window.history.pushState(null, "", "/login");
   };
+
+  if (supabase && !isRemoteReady) {
+    return (
+      <main className="grid min-h-screen place-items-center bg-[#f6f8fb] px-4">
+        <div className="rounded-lg border border-slate-200 bg-white p-5 text-sm font-medium text-slate-600 shadow-sm">Loading DevFlow...</div>
+      </main>
+    );
+  }
 
   if (!user) {
     return <AuthScreen mode={authMode} setMode={setAuthMode} store={store} setStore={setStore} setSessionId={setSessionId} />;
@@ -411,13 +503,14 @@ export default function DevFlowApp() {
               selected={selectedDetail?.kind === "project" ? selectedDetail.id : null}
               setSelected={(idValue) => setSelectedDetail({ kind: "project", id: idValue })}
               editProject={setProjectModal}
-              deleteProject={(projectId) =>
+              deleteProject={async (projectId) => {
+                if (await deleteRemote("deleteProject", projectId)) return;
                 setStore((current) => ({
                   ...current,
                   projects: current.projects.filter((item) => item.id !== projectId),
                   tasks: current.tasks.filter((item) => item.projectId !== projectId),
-                }))
-              }
+                }));
+              }}
             />
           )}
           {view === "tasks" && (
@@ -428,7 +521,10 @@ export default function DevFlowApp() {
               filters={filters}
               setFilters={setFilters}
               editTask={setTaskModal}
-              deleteTask={(taskId) => setStore((current) => ({ ...current, tasks: current.tasks.filter((item) => item.id !== taskId) }))}
+              deleteTask={async (taskId) => {
+                if (await deleteRemote("deleteTask", taskId)) return;
+                setStore((current) => ({ ...current, tasks: current.tasks.filter((item) => item.id !== taskId) }));
+              }}
             />
           )}
           {view === "board" && (
@@ -439,7 +535,12 @@ export default function DevFlowApp() {
               filters={filters}
               setFilters={setFilters}
               editTask={setTaskModal}
-              moveTask={(taskId, status) => {
+              moveTask={async (taskId, status) => {
+                const task = userTasks.find((item) => item.id === taskId);
+                if (task && (await remoteMutation({ action: "upsertTask", payload: { ...task, status } }))) {
+                  flash("Task status updated");
+                  return;
+                }
                 setStore((current) => ({
                   ...current,
                   tasks: current.tasks.map((item) => (item.id === taskId ? { ...item, status, updatedAt: new Date().toISOString() } : item)),
@@ -455,13 +556,14 @@ export default function DevFlowApp() {
               selected={selectedDetail?.kind === "sprint" ? selectedDetail.id : null}
               setSelected={(idValue) => setSelectedDetail({ kind: "sprint", id: idValue })}
               editSprint={setSprintModal}
-              deleteSprint={(sprintId) =>
+              deleteSprint={async (sprintId) => {
+                if (await deleteRemote("deleteSprint", sprintId)) return;
                 setStore((current) => ({
                   ...current,
                   sprints: current.sprints.filter((item) => item.id !== sprintId),
                   tasks: current.tasks.map((item) => (item.sprintId === sprintId ? { ...item, sprintId: null } : item)),
-                }))
-              }
+                }));
+              }}
             />
           )}
           {view === "settings" && <SettingsView user={user} logout={logout} />}
@@ -514,14 +616,42 @@ function AuthScreen({
   setSessionId: (id: string) => void;
 }) {
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const supabase = useMemo(() => getSupabaseBrowserClient(), []);
 
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    setError("");
+    setNotice("");
     const data = new FormData(event.currentTarget);
     const email = String(data.get("email") ?? "").trim().toLowerCase();
     const password = String(data.get("password") ?? "");
     const confirm = String(data.get("confirm") ?? "");
     if (!email || !password) return setError("Email and password are required.");
+    if (supabase) {
+      const result =
+        mode === "register"
+          ? await supabase.auth.signUp({ email, password })
+          : await supabase.auth.signInWithPassword({ email, password });
+      if (result.error) {
+        setError(
+          result.error.message.includes("email rate limit")
+            ? "Supabase email confirmation sedang kena rate limit. Tunggu beberapa menit atau matikan email confirmation untuk testing."
+            : result.error.message,
+        );
+        return;
+      }
+      if (mode === "register" && result.data.user && !result.data.session) {
+        setNotice("Account created. Check your email confirmation link before logging in.");
+        return;
+      }
+      if (result.data.session?.user) {
+        localStorage.removeItem("devflow-session");
+        setSessionId(result.data.session.user.id);
+        window.history.pushState(null, "", "/dashboard");
+      }
+      return;
+    }
     if (mode === "register") {
       if (password !== confirm) return setError("Password confirmation does not match.");
       if (store.users.some((item) => item.email === email)) return setError("Email already exists.");
@@ -552,6 +682,7 @@ function AuthScreen({
           </div>
         </div>
         {error && <p className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+        {notice && <p className="mb-4 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-700">{notice}</p>}
         <label className="field-label">Email</label>
         <input name="email" className="field-input" defaultValue={mode === "login" ? "demo@devflow.local" : ""} />
         <label className="field-label">Password</label>
@@ -994,7 +1125,7 @@ function TaskModal(props: { userId: string; task: Task | null; projects: Project
           <SelectField name="priority" label="Priority" defaultValue={task?.priority ?? "MEDIUM"} options={priorities.map((item) => [item, item])} />
           <div>
             <label className="field-label">Deadline</label>
-            <input name="deadline" type="date" className="field-input" defaultValue={task?.deadline ?? ""} />
+            <input name="deadline" type="date" className="field-input" defaultValue={dateInputValue(task?.deadline)} />
           </div>
         </div>
         <ModalActions onClose={props.onClose} />
@@ -1067,11 +1198,11 @@ function SprintModal({ userId, sprint, onClose, onSave }: { userId: string; spri
         <div className="grid gap-3 md:grid-cols-2">
           <div>
             <label className="field-label">Start date</label>
-            <input required name="startDate" type="date" className="field-input" defaultValue={sprint?.startDate ?? today} />
+            <input required name="startDate" type="date" className="field-input" defaultValue={dateInputValue(sprint?.startDate) || today} />
           </div>
           <div>
             <label className="field-label">End date</label>
-            <input required name="endDate" type="date" className="field-input" defaultValue={sprint?.endDate ?? offsetDate(7)} />
+            <input required name="endDate" type="date" className="field-input" defaultValue={dateInputValue(sprint?.endDate) || offsetDate(7)} />
           </div>
         </div>
         <ModalActions onClose={onClose} />
